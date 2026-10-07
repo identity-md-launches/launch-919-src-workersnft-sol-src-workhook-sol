@@ -92,6 +92,9 @@ library WorkerState {
         mapping(uint256 => bool) activated;
         mapping(uint256 => uint256) workCheckpoint;
         mapping(uint256 => uint256) workCredit;
+        uint256 pauseCooldownUntil;
+        uint256 emissionCarry;
+        address hookBinder;
     }
 }
 
@@ -104,7 +107,8 @@ library WorkerConstants {
     uint256 internal constant MINING_ALLOCATION = 100_000_000 ether;
     uint256 internal constant BURN_ALLOCATION = 50_000_000 ether;
     uint256 internal constant ERA_EMISSION = 12_500_000 ether;
-    uint256 internal constant PAUSE_DURATION = 72 hours;
+    uint256 internal constant PAUSE_DURATION = 24 hours;
+    uint256 internal constant EMISSION_END = 1785 days;
     uint256 internal constant INITIAL_DIFFICULTY_BITS = 12;
     uint256 internal constant SCALE = 1e27;
     bytes32 internal constant DOMAIN = keccak256("WorkersNFT.Work.v1");
@@ -126,7 +130,9 @@ contract WorkersNFT is WorkOwned {
     uint256 public constant MINING_ALLOCATION = 100_000_000 ether;
     uint256 public constant BURN_ALLOCATION = 50_000_000 ether;
     uint256 public constant ERA_EMISSION = 12_500_000 ether;
-    uint256 public constant PAUSE_DURATION = 72 hours;
+    uint256 public constant PAUSE_DURATION = 24 hours;
+    uint256 public constant PAUSE_COOLDOWN = 24 hours;
+    uint256 public constant EMISSION_END = 1785 days;
     uint256 public constant INITIAL_DIFFICULTY_BITS = 12;
     uint256 private constant SCALE = 1e27;
     bytes32 public constant DOMAIN = keccak256("WorkersNFT.Work.v1");
@@ -161,6 +167,7 @@ contract WorkersNFT is WorkOwned {
     event WorkerBurned(address indexed holder, uint256 indexed tokenId, uint256 reward);
     event Buyback(uint256 imdSpent, uint256 workBurned);
     event Swept(address indexed token, uint256 amount);
+    event MiningRemainderReleased(uint256 amount);
     error MintUnavailable();
     error InvalidWork();
     error InvalidToken();
@@ -374,11 +381,19 @@ contract WorkersNFT is WorkOwned {
         s.activationFee = 15 * s.imdUnit / 100;
         s.lastMintTime = block.timestamp;
         s.retargetTime = block.timestamp;
+        s.hookBinder = tx.origin;
     }
 
     /// @notice One-time binding, before deposits or minting.
     function setHook(address value) external onlyOwner {
         WorkerSale.setHook(s, value);
+    }
+
+    /// @notice Deploy-time binding: the hook calls this while its pool is being initialized, inside a
+    /// transaction sent by the same account that deployed this contract (tx.origin cannot be forged).
+    function bindHook() external {
+        if (tx.origin != s.hookBinder) revert Unauthorized();
+        WorkerSale.setHook(s, msg.sender);
     }
 
     function fundPools() external nonReentrant {
@@ -473,20 +488,39 @@ contract WorkersNFT is WorkOwned {
         return block.timestamp < s.pauseUntil;
     }
 
-    /// @notice Pauses minting and accrual for at most 72 hours; transfers and claims remain available.
+    /// @notice Pauses minting and accrual for at most 24 hours; transfers and claims remain available.
+    /// A new pause needs at least 24 hours unpaused since the previous one ended, so the owner cannot
+    /// chain pauses. Emission scheduled during a pause is carried forward, never lost.
     function pause() external onlyOwner {
-        if (paused()) revert InvalidParameter();
+        if (paused() || block.timestamp < s.pauseCooldownUntil) revert InvalidParameter();
         WorkerFinance._updateMining(s);
         s.pauseStarted = block.timestamp;
         s.pauseUntil = block.timestamp + PAUSE_DURATION;
+        s.pauseCooldownUntil = s.pauseUntil + PAUSE_COOLDOWN;
         emit Paused(s.pauseUntil);
     }
 
     function unpause() external onlyOwner {
+        if (!paused()) revert InvalidParameter();
         WorkerFinance._updateMining(s);
         s.pauseUntil = 0;
         s.pauseStarted = 0;
+        s.pauseCooldownUntil = block.timestamp + PAUSE_COOLDOWN;
         emit Unpaused();
+    }
+
+    function pauseCooldownUntil() external view returns (uint256) {
+        return s.pauseCooldownUntil;
+    }
+
+    function emissionCarry() external view returns (uint256) {
+        return s.emissionCarry;
+    }
+
+    /// @notice After every era has ended, WORK left in the mining pool (emission carried while nobody was
+    /// activated, or rounding dust) can be released to the builders address. Never touches owed WORK.
+    function releaseMiningRemainder() external onlyOwner nonReentrant {
+        WorkerFinance.releaseMiningRemainder(s);
     }
 
     function epoch() public view returns (uint256) {
@@ -932,6 +966,7 @@ library WorkerSale {
 
 /// @dev Statically linked implementation library; has no owner or configurable target.
 library WorkerFinance {
+    event MiningRemainderReleased(uint256 amount);
     event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
 
     event MetadataUpdate(uint256 tokenId);
@@ -1091,25 +1126,55 @@ library WorkerFinance {
         }
     }
 
-    /// @dev Eras are measured from mint end. Paused time and time without active workers
-    /// are skipped, with no retroactive distribution on activation or resume.
-    function _newEmission(WorkerState.Data storage s) private view returns (uint256 amount) {
-        if (!s.mintEnded || s.activeWorkers == 0) return 0;
+    /// @dev Eras are measured from mint end. Emission scheduled while paused or while no worker is
+    /// activated is held in emissionCarry and released to the activated workers at the first update
+    /// that is unpaused with at least one activated worker, so no scheduled WORK is ever lost.
+    function _emission(WorkerState.Data storage s) private view returns (uint256 amount, uint256 carry) {
+        carry = s.emissionCarry;
+        if (!s.mintEnded) return (0, carry);
         amount = scheduledEmission(s, block.timestamp) - scheduledEmission(s, s.lastMiningUpdate);
         uint256 start = s.lastMiningUpdate > s.pauseStarted ? s.lastMiningUpdate : s.pauseStarted;
         uint256 end = block.timestamp < s.pauseUntil ? block.timestamp : s.pauseUntil;
-        if (end > start) amount -= scheduledEmission(s, end) - scheduledEmission(s, start);
+        if (end > start) {
+            uint256 held = scheduledEmission(s, end) - scheduledEmission(s, start);
+            amount -= held;
+            carry += held;
+        }
+        if (s.activeWorkers == 0) {
+            carry += amount;
+            amount = 0;
+        } else if (block.timestamp >= s.pauseUntil) {
+            amount += carry;
+            carry = 0;
+        }
         if (amount > s.miningPool) amount = s.miningPool;
+        if (carry > s.miningPool - amount) carry = s.miningPool - amount;
+    }
+
+    function _newEmission(WorkerState.Data storage s) private view returns (uint256 amount) {
+        (amount,) = _emission(s);
     }
 
     function _updateMining(WorkerState.Data storage s) internal {
-        uint256 amount = _newEmission(s);
+        (uint256 amount, uint256 carry) = _emission(s);
+        s.emissionCarry = carry;
         if (amount != 0) {
             s.miningPool -= amount;
             s.workReserve += amount;
             s.accWorkPerWorker += amount * WorkerConstants.SCALE / s.activeWorkers;
         }
         if (s.mintEnded) s.lastMiningUpdate = block.timestamp;
+    }
+
+    function releaseMiningRemainder(WorkerState.Data storage s) internal {
+        if (!s.mintEnded || block.timestamp < s.mintEndTime + WorkerConstants.EMISSION_END) revert InvalidParameter();
+        _updateMining(s);
+        uint256 amount = s.miningPool;
+        if (amount == 0) revert InvalidParameter();
+        s.miningPool = 0;
+        s.emissionCarry = 0;
+        WorkTransfer.send(s.work, WorkerConstants.BUILDERS, amount);
+        emit MiningRemainderReleased(amount);
     }
 
     function pendingWork(WorkerState.Data storage s, uint256 id) internal view returns (uint256) {

@@ -43,6 +43,7 @@ interface IWorkers {
     function poolManager() external view returns (IPoolManager);
     function tickSpacing() external view returns (int24);
     function hook() external view returns (address);
+    function bindHook() external;
     function mintEnded() external view returns (bool);
     function totalWeight() external view returns (uint256);
     function notifyHookReward(uint256 amount) external;
@@ -187,6 +188,7 @@ contract WorkHook is WorkOwned {
     address public immutable imd;
     address public immutable work;
     address public immutable initializer;
+    address public immutable deployerOrigin;
     bool public immutable imdIs0;
     uint16 public feeBps = 75;
     uint16 public stakerShareBps = 10000;
@@ -235,6 +237,7 @@ contract WorkHook is WorkOwned {
                 || (uint160(address(this)) & 0x3fff) != REQUIRED_HOOK_FLAGS
         ) revert InvalidParameter();
         initializer = msg.sender;
+        deployerOrigin = tx.origin;
         poolManager = manager;
         workers = nft;
         imd = nft.imd();
@@ -268,8 +271,10 @@ contract WorkHook is WorkOwned {
     }
 
     function beforeInitialize(address sender, PoolKey calldata key, uint160) external onlyManager returns (bytes4) {
+        bool trusted = sender == initializer || sender == owner || tx.origin == deployerOrigin;
+        if (trusted && workers.hook() == address(0)) workers.bindHook();
         if (
-            (sender != initializer && sender != owner) || initialized || poolId != bytes32(0)
+            !trusted || initialized || poolId != bytes32(0)
                 || key.hooks != address(this) || key.fee != LP_FEE || key.tickSpacing != workers.tickSpacing()
                 || workers.hook() != address(this) || Currency.unwrap(key.currency0) != (imdIs0 ? imd : work)
                 || Currency.unwrap(key.currency1) != (imdIs0 ? work : imd)

@@ -17,6 +17,8 @@ import {WorkersNFT} from "src/WorkersNFT.sol";
 import {WorkTestBase, TestIMD, TestPoolManager, WorkerFixture} from "./WorkersNFT.t.sol";
 
 contract HookWorkersStandIn {
+    function bindHook() external {}
+
     address public work;
     address public imd;
     IPoolManager public poolManager;
@@ -432,7 +434,7 @@ contract WorkHookInitializationTest is HookFixture {
         vm.expectRevert(WorkHook.InvalidPool.selector);
         fresh.beforeInitialize(address(this), candidate, 1);
         workers.bind(address(fresh));
-        vm.prank(address(manager));
+        vm.prank(address(manager), ALICE);
         vm.expectRevert(WorkHook.InvalidPool.selector);
         fresh.beforeInitialize(ALICE, candidate, 1);
         candidate.fee = 10000;
@@ -623,5 +625,33 @@ contract WorkHookWorkersIntegrationTest is WorkerFixture, HookDeployment {
         eq(nft.claimIMD(), reserveBefore + hookFee);
         eq(imd.balanceOf(address(nft)), 0);
         eq(work.balanceOf(address(nft)), 150_000_000 ether);
+    }
+}
+
+contract WorkHookAutoBindTest is WorkerFixture, HookDeployment {
+    function test_PoolInitializationBindsTheHookWithoutAnOwnerCall() public {
+        vm.chainId(31337);
+        vm.warp(1000000);
+        vm.roll(1000);
+        work = new Work();
+        imd = new TestIMD(6);
+        manager = new TestPoolManager();
+        nft = new WorkersNFT(address(this), address(work), address(imd), manager, 60);
+        WorkHook h = _deployHook(manager, IWorkers(address(nft)));
+        require(nft.hook() == address(0), "not bound before pool init");
+        PoolKey memory k = nft.poolKey();
+        k.hooks = address(h);
+        // a stranger's transaction cannot initialize the pool or bind the hook
+        vm.prank(address(manager), address(0xBAD));
+        vm.expectRevert(WorkHook.InvalidPool.selector);
+        h.beforeInitialize(address(0xBAD), k, uint160(1 << 96));
+        require(nft.hook() == address(0), "stranger did not bind");
+        // the deploying account's pool initialization binds it in the same call
+        vm.prank(address(manager));
+        h.beforeInitialize(address(this), k, uint160(1 << 96));
+        require(nft.hook() == address(h), "bound by pool init");
+        vm.prank(address(manager));
+        h.afterInitialize(address(this), k, uint160(1 << 96), 0);
+        require(h.initialized());
     }
 }
