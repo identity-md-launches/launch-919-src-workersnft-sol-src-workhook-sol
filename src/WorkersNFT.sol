@@ -1167,7 +1167,9 @@ library WorkerFinance {
     }
 
     function releaseMiningRemainder(WorkerState.Data storage s) internal {
-        if (!s.mintEnded || block.timestamp < s.mintEndTime + WorkerConstants.EMISSION_END) revert InvalidParameter();
+        if (
+            !s.mintEnded || block.timestamp < s.mintEndTime + WorkerConstants.EMISSION_END || block.timestamp < s.pauseUntil
+        ) revert InvalidParameter();
         _updateMining(s);
         uint256 amount = s.miningPool;
         if (amount == 0) revert InvalidParameter();

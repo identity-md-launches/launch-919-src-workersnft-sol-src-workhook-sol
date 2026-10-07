@@ -2,8 +2,8 @@
 pragma solidity 0.8.26;
 
 import {WorkersNFT, WorkerState, WorkerSale} from "src/WorkersNFT.sol";
+import {Work} from "./mocks/Work.sol";
 import {
-    Work,
     WorkHook,
     WorkOwned,
     WorkTransfer,
@@ -941,6 +941,11 @@ contract WorkersNFTTest is WorkerFixture {
         vm.prank(ALICE);
         vm.expectRevert(WorkOwned.Unauthorized.selector);
         nft.releaseMiningRemainder();
+        // cannot be used while paused (carried WORK must reach workers first)
+        nft.pause();
+        vm.expectRevert(WorkOwned.InvalidParameter.selector);
+        nft.releaseMiningRemainder();
+        nft.unpause();
         uint256 before = work.balanceOf(nft.BUILDERS());
         nft.releaseMiningRemainder();
         eq(work.balanceOf(nft.BUILDERS()) - before, 100_000_000 ether);
